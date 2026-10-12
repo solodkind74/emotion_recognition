@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emotion Stream Demo</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --border: #e2e2dc;
+    --accent: #2f6fde; --track: #ecece6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --panel: #1f1f1d; --text: #ecece8; --muted: #9a9a93; --border: #33332f;
+            --accent: #6d9cf0; --track: #2c2c29; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 16px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+  h1 { font-size: 20px; margin: 0; }
+  .muted { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 0 16px 16px; }
+  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center; }
+  button, label.btn { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border);
+         background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=file] { display: none; }
+  .stage { position: relative; background: #000; border-radius: 12px; overflow: hidden; min-height: 240px; }
+  .stage video { display: block; width: 100%; height: auto; }
+  .stage video.mirror { transform: scaleX(-1); }
+  .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: #aaa; padding: 16px;
+                 text-align: center; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .panel h2 { font-size: 14px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+  .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .face { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; }
+  .face-head { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 6px; }
+  .bar { display: grid; grid-template-columns: 72px 1fr 40px; gap: 6px; align-items: center; font-size: 12px; }
+  .bar .track { height: 8px; background: var(--track); border-radius: 4px; overflow: hidden; }
+  .bar .fill { height: 100%; border-radius: 4px; transition: width .15s; }
+  .bar span:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  #timeline { width: 100%; height: 28px; display: block; border-radius: 6px; background: var(--track); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  #status { font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Emotion recognition on a video stream</h1>
+  <span class="muted" id="model">connecting…</span>
+</header>
+<main>
+  <section>
+    <div class="controls">
+      <button class="primary" id="camBtn">Start camera</button>
+      <label class="btn" for="fileInput">Play a video file</label>
+      <input type="file" id="fileInput" accept="video/*">
+      <button id="stopBtn" disabled>Stop</button>
+      <span class="muted" id="status"></span>
+    </div>
+    <div class="stage" id="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div class="placeholder" id="placeholder">Start the camera or pick a video file. Frames are analysed by the local server.</div>
+    </div>
+  </section>
+  <aside class="panel">
+    <h2>Live</h2>
+    <div class="stats">
+      <div class="stat"><span class="muted">FPS</span><b id="fps">–</b></div>
+      <div class="stat"><span class="muted">Latency</span><b id="latency">–</b></div>
+      <div class="stat"><span class="muted">Faces</span><b id="count">–</b></div>
+    </div>
+    <h2>Main face over time</h2>
+    <canvas id="timeline"></canvas>
+    <div class="legend" id="legend"></div>
+    <div id="faces"></div>
+  </aside>
+</main>
+<script>
+const COLORS = { angry: "#dc2828", contempt: "#a04696", disgust: "#3c8c28", fear: "#c85aaa",
+                 happy: "#ffc800", neutral: "#b4b4b4", sad: "#2878d2", surprise: "#ff8c00" };
+const CAPTURE_WIDTH = 640;
+const $ = (id) => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+const capture = document.createElement("canvas"), capCtx = capture.getContext("2d");
+const timeline = $("timeline"), tctx = timeline.getContext("2d");
+
+let ws = null, running = false, inFlight = false, mirror = false, last = null, history = [];
+let lastResponseAt = 0, fpsEma = 0;
+
+fetch("/api/info").then((r) => r.json()).then((info) => {
+  $("model").textContent = `model: ${info.model} — ${info.notes}`;
+  $("legend").innerHTML = info.labels.map((l) => `<span><i style="background:${COLORS[l]}"></i>${l}</span>`).join("");
+});
+
+function connect() {
+  return new Promise((resolve, reject) => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = resolve;
+    ws.onerror = () => reject(new Error("WebSocket connection failed"));
+    ws.onclose = () => { if (running) setStatus("Connection to server lost"); stop(); };
+    ws.onmessage = (e) => {
+      inFlight = false;
+      const msg = JSON.parse(e.data);
+      if (msg.error) { setStatus(msg.error); return; }
+      const now = performance.now();
+      if (lastResponseAt) fpsEma = fpsEma ? 0.9 * fpsEma + 0.1 * (1000 / (now - lastResponseAt)) : 1000 / (now - lastResponseAt);
+      lastResponseAt = now;
+      last = msg;
+      history.push(msg.faces.length ? COLORS[largest(msg.faces)[0].emotion] : null);
+      render(msg);
+    };
+  });
+}
+
+async function start(setupSource) {
+  stop();
+  try {
+    await setupSource();
+    await connect();
+  } catch (err) {
+    setStatus(err.message || String(err));
+    stop();
+    return;
+  }
+  running = true; inFlight = false; history = []; lastResponseAt = 0; fpsEma = 0;
+  $("placeholder").hidden = true;
+  $("stopBtn").disabled = false;
+  setStatus("");
+  requestAnimationFrame(pump);
+}
+
+function stop() {
+  running = false;
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  if (video.srcObject) { video.srcObject.getTracks().forEach((t) => t.stop()); video.srcObject = null; }
+  if (video.src) { video.pause(); URL.revokeObjectURL(video.src); video.removeAttribute("src"); video.load(); }
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  $("placeholder").hidden = false;
+  $("stopBtn").disabled = true;
+}
+
+// Send the current frame whenever the previous one has been answered, so the
+// stream self-throttles to whatever speed the server can sustain.
+function pump() {
+  if (!running) return;
+  if (!inFlight && video.readyState >= 2 && video.videoWidth && ws.readyState === WebSocket.OPEN) {
+    const scale = Math.min(1, CAPTURE_WIDTH / video.videoWidth);
+    capture.width = Math.round(video.videoWidth * scale);
+    capture.height = Math.round(video.videoHeight * scale);
+    capCtx.drawImage(video, 0, 0, capture.width, capture.height);
+    inFlight = true;
+    capture.toBlob((blob) => {
+      if (blob && ws && ws.readyState === WebSocket.OPEN) ws.send(blob); else inFlight = false;
+    }, "image/jpeg", 0.85);
+  }
+  requestAnimationFrame(pump);
+}
+
+function render(msg) {
+  const dpr = window.devicePixelRatio || 1;
+  overlay.width = overlay.clientWidth * dpr;
+  overlay.height = overlay.clientHeight * dpr;
+  const s = overlay.width / msg.width;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  ctx.font = `${Math.round(14 * dpr)}px system-ui, sans-serif`;
+  ctx.textBaseline = "bottom";
+  for (const f of msg.faces) {
+    let [x, y, w, h] = f.box.map((v) => v * s);
+    if (mirror) x = overlay.width - x - w;
+    const color = COLORS[f.emotion] || "#fff";
+    ctx.lineWidth = 3 * dpr; ctx.strokeStyle = color; ctx.strokeRect(x, y, w, h);
+    const label = `#${f.track_id} ${f.emotion} ${Math.round(f.confidence * 100)}%`;
+    const tw = ctx.measureText(label).width + 10 * dpr, th = 20 * dpr;
+    const ly = Math.max(y, th);
+    ctx.fillStyle = color; ctx.fillRect(x, ly - th, tw, th);
+    ctx.fillStyle = "#111"; ctx.fillText(label, x + 5 * dpr, ly - 3 * dpr);
+  }
+
+  $("fps").textContent = fpsEma ? fpsEma.toFixed(1) : "–";
+  $("latency").textContent = `${Math.round(msg.latency_ms)} ms`;
+  $("count").textContent = msg.faces.length;
+
+  const faces = largest(msg.faces);
+  $("faces").innerHTML = faces.map((f) => `
+    <div class="face">
+      <div class="face-head"><span>Face #${f.track_id}</span><span style="color:${COLORS[f.emotion]}">${f.emotion}</span></div>
+      ${Object.entries(f.probabilities).map(([k, p]) => `
+        <div class="bar"><span>${k}</span>
+          <div class="track"><div class="fill" style="width:${(p * 100).toFixed(1)}%;background:${COLORS[k]}"></div></div>
+          <span>${Math.round(p * 100)}%</span></div>`).join("")}
+    </div>`).join("");
+
+  drawTimeline();
+}
+
+function largest(faces) {
+  return [...faces].sort((a, b) => b.box[2] * b.box[3] - a.box[2] * a.box[3]);
+}
+
+function drawTimeline() {
+  const dpr = window.devicePixelRatio || 1;
+  timeline.width = timeline.clientWidth * dpr; timeline.height = timeline.clientHeight * dpr;
+  const step = 3 * dpr, n = Math.floor(timeline.width / step);
+  if (history.length > n) history = history.slice(-n);
+  tctx.clearRect(0, 0, timeline.width, timeline.height);
+  history.forEach((c, i) => {
+    if (!c) return;
+    tctx.fillStyle = c;
+    tctx.fillRect(timeline.width - (history.length - i) * step, 0, step, timeline.height);
+  });
+}
+
+function setStatus(text) { $("status").textContent = text; }
+
+$("camBtn").onclick = () => start(async () => {
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera needs localhost or HTTPS");
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false });
+  mirror = true; video.classList.add("mirror"); video.loop = false;
+  await video.play();
+});
+
+$("fileInput").onchange = (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  start(async () => {
+    video.src = URL.createObjectURL(file);
+    mirror = false; video.classList.remove("mirror"); video.loop = true;
+    await video.play();
+  });
+};
+
+$("stopBtn").onclick = () => { stop(); setStatus("Stopped"); };
+window.addEventListener("resize", () => { if (last && running) render(last); });
+</script>
+</body>
+</html>
